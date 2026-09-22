@@ -1,0 +1,201 @@
+name: Track upstream and publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - .github/workflows/deploy-image.yml
+      - .github/dependabot.yml
+      - scripts/verify-image.sh
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/deploy-image.yml
+      - .github/dependabot.yml
+      - scripts/verify-image.sh
+  schedule:
+    # GitHub schedules use UTC. Check upstream once a day.
+    - cron: "17 4 * * *"
+    # Forced weekly rebuild: refresh the pinned base and runtime for the
+    # current release even when nothing new was published upstream.
+    - cron: "47 4 * * 0"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  UPSTREAM_REPOSITORY: Sude-/lgogdownloader
+
+jobs:
+  # Pull requests build and verify with the Dockerfile's own pinned version and
+  # never authenticate or publish. Fork pull requests get the same validation:
+  # no login step exists in this job, so there is no secret or write path to
+  # hand a fork.
+  validate-pull-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Read the Dockerfile's default version
+        id: version
+        run: |
+          version="$(awk -F= '/^ARG GOGDL_VERSION=/ {gsub(/ /, "", $2); print $2}' Dockerfile)"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Build and load the image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: gogdl:verify
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the built image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash scripts/verify-image.sh gogdl:verify "${VERSION}"
+
+  build-and-push-image:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json="$(
+            curl --fail --silent --show-error --location --retry 3 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest"
+          )"
+
+          tag="$(jq -r '.tag_name' <<<"${release_json}")"
+          version="${tag#v}"
+          asset_name="lgogdownloader-${version}.tar.gz"
+          digest="$(
+            jq -r --arg name "${asset_name}" \
+              '.assets[] | select(.name == $name) | .digest' \
+              <<<"${release_json}"
+          )"
+          sha256="${digest#sha256:}"
+
+          if [[ ! "${tag}" =~ ^v[0-9]+([.][0-9]+)*$ ]]; then
+            echo "Unexpected upstream release tag: ${tag}" >&2
+            exit 1
+          fi
+          if [[ ! "${sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Missing or invalid SHA-256 for upstream asset ${asset_name}" >&2
+            exit 1
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "sha256=${sha256}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Set image name
+        id: image
+        run: |
+          repository="$(tr '[:upper:]' '[:lower:]' <<<"${GITHUB_REPOSITORY}")"
+          echo "name=${REGISTRY}/${repository}" >>"${GITHUB_OUTPUT}"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether this run publishes
+        id: decide
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          exists=false
+          if docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          skip=false
+          # The daily discovery skips a version that is already published; the
+          # weekly forced rebuild always rebuilds, so the pinned base and the
+          # runtime never go stale inside a supported release.
+          if [[ "${SCHEDULE}" == "17 4 * * *" && "${exists}" == "true" ]]; then
+            skip=true
+            echo "${IMAGE}:${VERSION} is already published; daily discovery skips"
+          fi
+
+          {
+            echo "skip=${skip}"
+            echo "exists=${exists}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Extract metadata (tags, labels) for Docker
+        if: steps.decide.outputs.skip != 'true'
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.version }}
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        if: steps.decide.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and load for verification
+        if: steps.decide.outputs.skip != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: gogdl:verify
+          build-args: |
+            GOGDL_VERSION=${{ steps.upstream.outputs.version }}
+            GOGDL_SHA256=${{ steps.upstream.outputs.sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the built image
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: bash scripts/verify-image.sh gogdl:verify "${VERSION}"
+
+      - name: Push the verified image
+        if: steps.decide.outputs.skip != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GOGDL_VERSION=${{ steps.upstream.outputs.version }}
+            GOGDL_SHA256=${{ steps.upstream.outputs.sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

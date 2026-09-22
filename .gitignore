@@ -1,0 +1,9 @@
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+
+# Local verification artifacts (scripts/verify-image.sh writes outside the repo)
+*.tar.gz
+lgogdownloader/
+htmlcxx/

@@ -1,0 +1,10 @@
+# The build context needs the Dockerfile and nothing else.
+.git
+.github
+plans
+scripts
+README.md
+LICENSE
+SECURITY.md
+.gitignore
+.dockerignore
