@@ -77,9 +77,14 @@ grep -qi 'lgogdownloader' <<<"$help_output" ||
 # assertion that would be meaningless without the mounts is not allowed to
 # pass silently.
 tmp="$(mktemp -d)"
+# The helper hands ownership to UID 1000 during the probe; hand it back to the
+# caller before removal or the sticky-bit /tmp refuses the delete (the CI
+# runner is not root, and the failed rm would fail the whole job after the
+# verification has already passed).
+caller_uid="$(id -u)"
 cleanup() {
   docker run --rm -v "$tmp:/work" --entrypoint sh --user 0 "$image" \
-    -c 'chmod -R u+rwX,go+rwX /work' >/dev/null 2>&1 || true
+    -c "chown -R ${caller_uid}: /work" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
