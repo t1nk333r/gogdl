@@ -70,12 +70,19 @@ grep -qi 'lgogdownloader' <<<"$help_output" ||
   fail "the default invocation did not display help"
 
 # --- persistence: mounted paths are writable by UID 1000 and stay theirs ------
-# The mount setup runs through the image itself with a --user 0 override so the
-# script needs no host root (the CI runner is not root). This is test
-# scaffolding only: the assertions below still check that the *runtime* user
-# owns what the container creates.
+# Mount preparation and cleanup run through the image itself with a --user 0
+# override, so the script needs no host root (the CI runner is not root). The
+# write probe and the ownership assertions run INSIDE the container, and the
+# container asserts its own bind mounts through /proc/self/mounts first — an
+# assertion that would be meaningless without the mounts is not allowed to
+# pass silently.
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  docker run --rm -v "$tmp:/work" --entrypoint sh --user 0 "$image" \
+    -c 'chmod -R u+rwX,go+rwX /work' >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 mkdir -p "$tmp/config" "$tmp/cache" "$tmp/downloads"
 docker run --rm -v "$tmp:/work" --entrypoint sh --user 0 "$image" \
   -c 'chown -R 1000:1000 /work'
@@ -87,19 +94,28 @@ docker run --rm \
   "$image" --version >/dev/null ||
   fail "the version invocation against mounted paths failed"
 
-docker run --rm \
+probe_output="$(docker run --rm \
   -v "$tmp/config:/config" \
   -v "$tmp/cache:/cache" \
   -v "$tmp/downloads:/downloads" \
   --entrypoint sh "$image" \
-  -c 'mkdir -p /config/lgogdownloader /cache/lgogdownloader && touch /config/lgogdownloader/probe /cache/lgogdownloader/probe /downloads/probe' ||
-  fail "UID $runtime_uid cannot write the mounted paths"
+  -c '
+    set -e
+    id -u
+    for mount in /config /cache /downloads; do
+      grep -q " $mount " /proc/self/mounts ||
+        { echo "FATAL: $mount is not a mount in this container"; exit 3; }
+    done
+    mkdir -p /config/lgogdownloader /cache/lgogdownloader
+    touch /config/lgogdownloader/probe /cache/lgogdownloader/probe /downloads/probe
+    stat -c "%u %n" /config/lgogdownloader /config/lgogdownloader/probe /cache/lgogdownloader/probe /downloads/probe
+  ' 2>&1)" ||
+  { printf '%s\n' "$probe_output" >&2; fail "the UID 1000 write probe against the mounted paths failed"; }
+printf '%s\n' "$probe_output"
 
-for probe in "$tmp/config/lgogdownloader" "$tmp/cache/lgogdownloader"; do
-  [ -d "$probe" ] || fail "$probe was not created by the container"
-  owner="$(stat -c '%u' "$probe")"
+while read -r owner path; do
   [ "$owner" = "$runtime_uid" ] ||
-    fail "$probe is owned by $owner, want $runtime_uid"
-done
+    fail "$path is owned by $owner, want $runtime_uid"
+done <<<"$probe_output"
 
 echo "Image verification passed: $image (LGOGDownloader $version)"
