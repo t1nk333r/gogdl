@@ -70,10 +70,15 @@ grep -qi 'lgogdownloader' <<<"$help_output" ||
   fail "the default invocation did not display help"
 
 # --- persistence: mounted paths are writable by UID 1000 and stay theirs ------
+# The mount setup runs through the image itself with a --user 0 override so the
+# script needs no host root (the CI runner is not root). This is test
+# scaffolding only: the assertions below still check that the *runtime* user
+# owns what the container creates.
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/config" "$tmp/cache" "$tmp/downloads"
-chown -R "$runtime_uid:$runtime_uid" "$tmp"
+docker run --rm -v "$tmp:/work" --entrypoint sh --user 0 "$image" \
+  -c 'chown -R 1000:1000 /work'
 
 docker run --rm \
   -v "$tmp/config:/config" \
